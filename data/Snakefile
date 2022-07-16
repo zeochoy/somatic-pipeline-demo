@@ -1,0 +1,248 @@
+configfile: "config.yaml"
+
+
+GATK=config["GATK"]
+PICARD=config["PICARD"]
+BED=config["BED"]
+ANNOVAR_2AVI=config["ANNOVAR_2AVI"]
+ANNOVAR_ANNOTATE=config["ANNOVAR_ANNOTATE"]
+ANNOVAR_DB=config["ANNOVAR_DB"]
+DIR=config["proj_dir"]
+VCF2MAF=config["VCF2MAF"]
+VEP_DIR=config["VEP_DIR"]
+ONCOKB=config["ONCOKB"]
+ONCOKB_TOKEN=config["ONCOKB_TOKEN"]
+COMMON_VCF=config["COMMON_VCF"]
+REF=config["REF"]
+COMBINE_FILT_SORT_ANNO_SCRT=config["COMBINE_FILT_SORT_ANNO_SCRT"]
+
+
+rule bwa_align:
+    """
+    align the fastq to ref (hg19/hg38) with BWA
+    """
+    input:
+        fa = REF,
+        fq1 = lambda wildcards: config["fq"][wildcards.sample] + '_R1_001.fastq.gz',
+        fq2 = lambda wildcards: config["fq"][wildcards.sample] + '_R2_001.fastq.gz'
+    output:
+        "bam/{sample}_sorted.bam"
+    log:
+        "logs/bwa_align/{sample}.log"
+    threads: 64
+    shell:
+        "(bwa mem -t {threads} '{input.fa}' '{input.fq1}' '{input.fq2}' | "
+        "samtools view -Sb - | "
+        "samtools sort - -o {output}) 2> {log}"
+
+
+rule samtools_index:
+    """
+    index the BAM
+    """
+    input:
+        "bam/{sample}_sorted.bam"
+    output:
+        "bam/{sample}_sorted.bam.bai"
+    shell:
+        "samtools index {input}"
+
+
+rule picard_addrg:
+    """
+    Add readgroup tag to the BAM
+    """
+    input:
+        "bam/{sample}_sorted.bam"
+    output:
+        temp("bam/{sample}_sorted_addrg.bam")
+    log:
+        "logs/picard_addrg/{sample}.log"
+    threads: 1
+    resources:
+        mem_mb=98304
+    params:
+        rgsm="{sample}"
+    shell:
+        "java -Xms64G -Xmx96G -jar {PICARD} AddOrReplaceReadGroups I={input} O={output} RGLB=OM466 RGPL=IlluminaNS550 RGPU={run} RGSM={params.rgsm}"
+
+
+rule picard_markdup:
+    """
+    Mark PCR duplicates with PICARD
+    """
+    input:
+        "bam/{sample}_sorted_addrg.bam"
+    output:
+        bam=protected("bam/{sample}_sorted_markdup.bam"),
+        metrics=protected("bam/{sample}_sorted_markdup_metrics.txt")
+    log:
+        "logs/picard_markdup/{sample}.log"
+    threads:  1
+    resources:
+        mem_mb=98304
+    shell:
+        "java -Xms64G -Xmx96G -jar {PICARD} MarkDuplicates I={input} O={output.bam} M={output.metrics}"
+
+
+rule samtools_index_markdup_bam:
+    """
+    Index the markdup_bam
+    """
+    input:
+        "bam/{sample}_sorted_markdup.bam"
+    output:
+        "bam/{sample}_sorted_markdup.bam.bai"
+    shell:
+        "samtools index {input}"
+
+
+rule mutect2:
+    """
+    Paired somatic variant calling using Mutect2
+    """
+    input:
+        tbam="bam/{sample}T_sorted_markdup.bam",
+        nbam="bam/{sample}B_sorted_markdup.bam"
+    output:
+        vcf=temp("vcf/{sample}_unfilt.vcf"),
+        f1r2="vcf/{sample}.f1r2.tar.gz"
+    log:
+        "logs/mutect2/{sample}.log"
+    threads: 64
+    params:
+        nsamp="{sample}B"
+    shell:
+        "{GATK} Mutect2 -R {ref} -I {input.tbam} -I {input.nbam} -normal {params.nsamp} -O {output.vcf} -L {BED} --f1r2-tar-gz {output.f1r2} --independent-mates --native-pair-hmm-threads {threads} --java-options '-Xms64G -Xmx96G'"
+
+
+rule gatk_read_orientation_bias:
+    """
+    Learn read orientation bias from FFPE tissue
+    """
+    input:
+        "vcf/{sample}.f1r2.tar.gz"
+    output:
+        "vcf/{sample}.read-orientation-model.tar.gz"
+    log:
+        "logs/gatk_read_orientation_bias/{sample}.log"
+    resources:
+        mem_mb=98304
+    shell:
+        "{GATK} LearnReadOrientationModel -I {input} -O {output}"
+
+
+rule gatk_filter_mutect:
+    """
+    Filter read strand biased calls
+    """
+    input:
+        vcf="vcf/{sample}_unfilt.vcf",
+        ob="vcf/{sample}.read-orientation-model.tar.gz"
+    output:
+        temp("vcf/{sample}_gatkfilt.vcf")
+    log:
+        "logs/gatk_filter_mutect/{sample}.log"
+    resources:
+        mem_mb=98304
+    shell:
+        "{GATK} FilterMutectCalls -R {ref} -V {input.vcf} -O {output} --ob-priors {input.ob} --java-options '-Xms64G -Xmx96G'"
+
+
+rule bcftools_vanfilt:
+    """
+    Vanilla filtering
+    """
+    input:
+        "vcf/{sample}_gatkfilt.vcf"
+    output:
+        "vcf/{sample}_gatkfilt_vanfilt.vcf"
+    log:
+        "logs/bcftools_vanfilt/{sample}.log"
+    shell:
+        """bcftools view -i 'FMT/GT!="0/0" & FMT/AF>=0.01 & FILTER="PASS" & FMT/DP>30 & FMT/AD[0:1]>4' {input} > {output}"""
+
+
+rule annovar_2avi:
+    """
+    Convert VCF as ANNOVAR input
+    """
+    input:
+        "vcf/{sample}_gatkfilt_vanfilt.vcf"
+    output:
+        "annotated/{sample}.avinput"
+    log:
+        "logs/annovar_2avi/{sample}.log"
+    threads: 1
+    shell:
+        "perl {ANNOVAR_2AVI} -format vcf4 {input} -outfile {output} -includeinfo"
+
+
+rule annovar_annotate:
+    """
+    Annotate the VCF with ANNOVAR
+    """
+    input:
+        "annotated/{sample}.avinput"
+    output:
+        "annotated/{sample}.hg19_multianno.txt"
+    log:
+        "logs/annovar_annotate/{sample}.log"
+    threads: 64
+    params:
+        suffix="annotated/{sample}"
+    shell:
+        "perl {ANNOVAR_ANNOTATE} {input} {ANNOVAR_DB} -buildver hg19 -out {params.suffix} -remove -protocol intervar_20180118,mcap14,revel,clinvar_20200316 -operation f,f,f,f -nastring . -polish -dot2underline -otherinfo -thread {threads} -maxgenethread {threads}"
+
+
+rule vcf2maf:
+    """
+    Convert the VCF to MAF for OncoKB annotator
+    """
+    input:
+        "vcf/{sample}_gatkfilt_vanfilt.vcf"
+    output:
+        "annotated/{sample}_gatkfilt_vanfilt.maf"
+    log:
+        "logs/vcf2maf/{sample}.log"
+    params:
+        sample="{sample}",
+        tmp_dir="annotated"
+    threads: 1
+    shell:
+        "perl {VCF2MAF} --input-vcf {input} --output-maf {output} --ref-fasta {REF} --filter-vcf {COMMON_VCF} --vep-path {VEP_DIR} --tumor-id {params.sample} --tmp-dir {params.tmp_dir}"
+
+
+rule annotate_oncokb:
+    """
+    Annotate the VCF with OncoKB
+    """
+    input:
+        maf="annotated/{sample}_gatkfilt_vanfilt.maf",
+        type=lambda wildcards: config["oncokb_type"][wildcards.sample]
+    output:
+        "annotated/{sample}_oncokb_maf.txt"
+    log:
+        "logs/annotate_oncokb/{sample}.log"
+    threads: 1
+    shell:
+        "python {ONCOKB} -i {input.maf} -o {output} -b {ONCOKB_TOKEN} -t {input.type} 2> {log}"
+
+
+rule combine_filt_sort_anno:
+    """
+    Final touch up to combine the annotated VCF (ANNOVAR & OncoKB) to TSV
+    """
+    input:
+        av="annotated/{sample}.hg19_multianno.txt",
+        maf="annotated/{sample}_oncokb_maf.txt",
+        vcf="vcf/{sample}_gatkfilt_vanfilt.vcf"
+    output:
+        "annotated/{sample}_annotated.txt"
+    log:
+        "logs/combine_filt_sort_anno/{sample}.log"
+    params:
+        sample="{sample}"
+    threads: 1
+    shell:
+        "python {COMBINE_FILT_SORT_ANNO_SCRT} {params.sample} 2> {log}"
